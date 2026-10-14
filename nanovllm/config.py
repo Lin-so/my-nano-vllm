@@ -11,10 +11,10 @@ class Config:
     max_num_seqs: int = 512 # 单批次最大请求数
     max_model_len: int = 2048 # 4096 # 单请求最大推理token，isl+osl
     gpu_memory_utilization: float = 0.9 # GPU显存最高使用比例
-    tensor_parallel_size: int = 1 # GPU数
+    tensor_parallel_size: int = 1 # 张量并行数（GPU数）
     enforce_eager: bool = False # False 表示启用 CUDA Graph 优化， True 表示禁用 CUDA Graph 优化
     enable_chunked_prefill: bool = True # 是否启用PD混合批次Chunked Prefill，启用后ITL（Token间延迟）降低，TTFP（首token耗时）增加
-    enable_fp8_kvcache: bool = False # 是否启用FP8 KVCache
+    enable_fp8_kvcache: bool = True # 是否启用FP8 KVCache
     long_prefill_token_threshold: int = 512 # 长prompt阈值，超过将分块
     enable_ngram_spec_decode: bool = True # 是否启用Ngram投机解码：利用序列自身的ngram历史提出草稿token，由目标模型一次前向验证，可降低decode阶段延迟
     ngram_spec_num_tokens: int = 4 # Ngram投机解码每步最多提出的草稿token数（k）

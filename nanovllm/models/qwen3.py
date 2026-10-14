@@ -11,6 +11,29 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
+def get_quant_config(config: Qwen3Config) -> dict | None:
+    """解析 compressed-tensors 的 FP8_BLOCK 权重量化（权重静态分块 + 激活动态按组）。"""
+    qc = getattr(config, "quantization_config", None)
+    if not isinstance(qc, dict) or qc.get("quant_method") != "compressed-tensors":
+        return None
+    for group in qc.get("config_groups", {}).values():
+        weights = group.get("weights") or {}
+        activations = group.get("input_activations") or {}
+        if (weights.get("type") == "float" and weights.get("num_bits") == 8
+                and weights.get("strategy") == "block" and activations.get("dynamic")):
+            weight_block_size = tuple(weights["block_structure"])
+            act_group_size = activations.get("group_size")
+            # kernel 目前固定 128x128 权重分块、128 激活分组
+            assert weight_block_size == (128, 128) and act_group_size == 128, (
+                f"暂不支持的 FP8 量化布局: weight_block={weight_block_size}, "
+                f"act_group={act_group_size}，需要均为 128")
+            return {
+                "weight_block_size": weight_block_size,
+                "act_group_size": act_group_size,
+            }
+    return None
+
+
 class Qwen3Attention(nn.Module):
 
     def __init__(
@@ -24,6 +47,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        quant_config: dict | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -45,11 +69,13 @@ class Qwen3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            quant_config=quant_config,
         )
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
@@ -94,17 +120,20 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        quant_config: dict | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            quant_config=quant_config,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            quant_config=quant_config,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -121,6 +150,7 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        quant_config: dict | None = None,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -133,11 +163,13 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            quant_config=quant_config,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -163,10 +195,12 @@ class Qwen3Model(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        quant_config: dict | None = None,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [Qwen3DecoderLayer(config, quant_config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -196,7 +230,11 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        quant_config = get_quant_config(config)
+        if quant_config is not None:
+            print(f"[nanovllm] 启用 FP8 分块量化线性层: {quant_config}")
+        self.model = Qwen3Model(config, quant_config)
+        # lm_head / embed_tokens 在量化 ignore 列表中，保持 BF16
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
